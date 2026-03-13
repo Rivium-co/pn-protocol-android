@@ -1,0 +1,10 @@
+.gradle/
+build/
+pn-protocol/build/
+*.aar
+*.apk
+local.properties
+.idea/
+*.iml
+.DS_Store
+.claude/
