@@ -49,7 +49,7 @@ mavenPublishing {
     publishToMavenCentral(com.vanniktech.maven.publish.SonatypeHost.CENTRAL_PORTAL, automaticRelease = true)
     signAllPublications()
 
-    coordinates("co.rivium", "pn-protocol", "0.2.0")
+    coordinates("co.rivium", "pn-protocol", "0.2.1")
 
     pom {
         name.set("PN Protocol")

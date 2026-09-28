@@ -24,7 +24,7 @@ data class PNConfig(
     val auth: PNAuth? = null,
 
     /** Keep connection alive interval in seconds (MQTT: keepAliveInterval) */
-    val heartbeatInterval: Int = 60,
+    val heartbeatInterval: Int = 30,
 
     /** Connection timeout in seconds */
     val connectionTimeout: Int = 30,
@@ -36,13 +36,13 @@ data class PNConfig(
     val autoReconnect: Boolean = true,
 
     /** Maximum reconnect attempts (0 = infinite) */
-    val maxReconnectAttempts: Int = 10,
+    val maxReconnectAttempts: Int = 0,
 
     /** Initial reconnect delay in milliseconds */
     val reconnectDelay: Long = 1000,
 
-    /** Maximum reconnect delay in milliseconds */
-    val maxReconnectDelay: Long = 300000,
+    /** Maximum reconnect delay in milliseconds (a ±20 % jitter is applied) */
+    val maxReconnectDelay: Long = 60000,
 
     /** Exit signal - message sent on unexpected disconnect (MQTT: Last Will) */
     val exitSignal: PNExitSignal? = null,
@@ -58,13 +58,13 @@ data class PNConfig(
         private var port: Int = 1883
         private var clientId: String = ""
         private var auth: PNAuth? = null
-        private var heartbeatInterval: Int = 60
+        private var heartbeatInterval: Int = 30
         private var connectionTimeout: Int = 30
         private var freshStart: Boolean = true
         private var autoReconnect: Boolean = true
-        private var maxReconnectAttempts: Int = 10
+        private var maxReconnectAttempts: Int = 0
         private var reconnectDelay: Long = 1000
-        private var maxReconnectDelay: Long = 300000
+        private var maxReconnectDelay: Long = 60000
         private var exitSignal: PNExitSignal? = null
         private var secure: Boolean = false
 

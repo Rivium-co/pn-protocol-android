@@ -7,10 +7,9 @@ import org.eclipse.paho.client.mqttv3.*
 import org.eclipse.paho.client.mqttv3.persist.MemoryPersistence
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
-import kotlin.math.min
-import kotlin.math.pow
 
 /**
  * PNSocket - Main connection handler for PN Protocol
@@ -31,11 +30,21 @@ class PNSocket(
 ) {
     companion object {
         private const val TAG = "PNSocket"
-        private const val BACKOFF_MULTIPLIER = 2.0
-        private const val JITTER_FACTOR = 0.2
+
+        /** Pause before trying the next endpoint after a failed attempt. */
+        private const val FAILOVER_DELAY_MS = 250L
+
+        /** Default time to wait for a ping response in [probe]. */
+        const val DEFAULT_PROBE_TIMEOUT_MS = 15_000L
+
+        /** Tears down abandoned clients off the calling thread. */
+        private val cleanupExecutor = Executors.newSingleThreadExecutor { r ->
+            Thread(r, "pn-socket-cleanup").apply { isDaemon = true }
+        }
     }
 
     // MQTT client (internal implementation)
+    @Volatile
     private var mqttClient: MqttAsyncClient? = null
 
     // State
@@ -51,10 +60,21 @@ class PNSocket(
     // Reconnection state
     private val retryAttempt = AtomicInteger(0)
     private val isRetrying = AtomicBoolean(false)
-    private val isConnecting = AtomicBoolean(false)
     private val manualDisconnect = AtomicBoolean(false)
+    @Volatile
     private var retryRunnable: Runnable? = null
     private val mainHandler = Handler(Looper.getMainLooper())
+
+    // One connect attempt at a time; callbacks of abandoned clients are ignored
+    private val connectGuard = PNConnectGuard()
+
+    // Endpoint failover
+    private val rotation = PNEndpointRotation()
+    @Volatile
+    private var endpointProvider: PNEndpointProvider? = null
+    private val endpointListeners = CopyOnWriteArrayList<PNEndpointListener>()
+    @Volatile
+    private var connectedEndpoint: PNEndpoint? = null
 
     // ========================================================================
     // Public API
@@ -70,6 +90,7 @@ class PNSocket(
 
         manualDisconnect.set(false)
         resetRetryState()
+        rotation.reset()
         connectInternal()
         return this
     }
@@ -78,23 +99,34 @@ class PNSocket(
      * Close connection gracefully (MQTT: disconnect)
      */
     fun close(): PNSocket {
-        if (state == PNState.DISCONNECTED) return this
-
-        Log.d(TAG, "Closing connection")
         manualDisconnect.set(true)
         cancelRetry()
-        isConnecting.set(false)
+        rotation.reset()
+        // Any attempt still in flight is abandoned: its callbacks become no-ops
+        connectGuard.invalidate()
+
+        if (state == PNState.DISCONNECTED) {
+            mqttClient?.let { shutdownQuietly(it) }
+            mqttClient = null
+            connectedEndpoint = null
+            return this
+        }
+
+        Log.d(TAG, "Closing connection")
 
         state = PNState.DISCONNECTING
         notifyStateChange(PNState.DISCONNECTING)
 
+        val client = mqttClient
         try {
-            mqttClient?.disconnect()?.waitForCompletion(5000)
-            mqttClient?.close()
+            client?.disconnect()?.waitForCompletion(5000)
+            client?.close()
         } catch (e: Exception) {
             Log.w(TAG, "Error during close: ${e.message}")
+            client?.let { shutdownQuietly(it) }
         } finally {
             mqttClient = null
+            connectedEndpoint = null
             activeChannels.clear()
             state = PNState.DISCONNECTED
             notifyStateChange(PNState.DISCONNECTED)
@@ -105,22 +137,110 @@ class PNSocket(
 
     /**
      * Reconnect immediately without destroying the socket.
-     * Cancels any pending retry and triggers an immediate connection attempt.
+     * Cancels any pending retry, resets the backoff and triggers an immediate
+     * connection attempt. No-op while connected or connecting.
      * Unlike close()+open(), this preserves activeChannels so resubscription works.
      */
-    fun reconnectImmediately(): PNSocket {
-        if (state == PNState.CONNECTED || state == PNState.CONNECTING) {
+    fun reconnectImmediately(): PNSocket = reconnectImmediately(force = false)
+
+    /**
+     * Like [reconnectImmediately]. With [force] = true an existing connection or
+     * in-flight attempt is dropped first — use it when the network changed and the
+     * current socket is bound to a network that is gone.
+     */
+    fun reconnectImmediately(force: Boolean): PNSocket {
+        if (!force && (state == PNState.CONNECTED || state == PNState.CONNECTING)) {
             Log.d(TAG, "reconnectImmediately() skipped - state is $state")
             return this
         }
 
-        Log.d(TAG, "Reconnecting immediately")
-        cancelRetry()
-        isConnecting.set(false)
+        Log.d(TAG, "Reconnecting immediately (force=$force, state=$state)")
         manualDisconnect.set(false)
+        resetRetryState()
+        rotation.reset()
+
+        if (force) {
+            val wasConnected = state == PNState.CONNECTED
+            connectGuard.invalidate()
+            mqttClient?.let { shutdownQuietly(it) }
+            mqttClient = null
+            connectedEndpoint = null
+            state = PNState.DISCONNECTED
+            if (wasConnected) {
+                notifyStateChange(PNState.DISCONNECTED)
+                notifyDisconnected("Reconnecting")
+            }
+        }
+
         connectInternal()
         return this
     }
+
+    /**
+     * Check that an established connection is still alive, e.g. after the device
+     * woke up. Sends a ping if nothing was received recently; if the gateway does
+     * not answer within [timeoutMs], the connection is replaced.
+     * Does nothing unless connected.
+     */
+    @JvmOverloads
+    fun probe(timeoutMs: Long = DEFAULT_PROBE_TIMEOUT_MS): PNSocket {
+        if (state != PNState.CONNECTED) return this
+        val client = mqttClient ?: return this
+        val gen = connectGuard.current()
+
+        if (!client.isConnected) {
+            Log.w(TAG, "probe(): client no longer connected - reconnecting")
+            reconnectImmediately(force = true)
+            return this
+        }
+
+        val token = try {
+            client.checkPing(null, null)
+        } catch (e: Exception) {
+            Log.w(TAG, "probe(): ping failed (${e.message}) - reconnecting")
+            reconnectImmediately(force = true)
+            return this
+        }
+
+        if (token == null) {
+            Log.d(TAG, "probe(): recent traffic, connection alive")
+            return this
+        }
+
+        Log.d(TAG, "probe(): ping sent, waiting up to ${timeoutMs}ms")
+        mainHandler.postDelayed({
+            if (!token.isComplete && state == PNState.CONNECTED &&
+                mqttClient === client && connectGuard.isCurrent(gen)
+            ) {
+                Log.w(TAG, "probe(): no ping response within ${timeoutMs}ms - reconnecting")
+                reconnectImmediately(force = true)
+            }
+        }, timeoutMs)
+        return this
+    }
+
+    /**
+     * Endpoints to try, in order, at the start of each connection round.
+     * Without a provider (or when it returns an empty list) the gateway/port/secure
+     * from [PNConfig] is used, as before.
+     */
+    fun setEndpointProvider(provider: PNEndpointProvider?): PNSocket {
+        endpointProvider = provider
+        return this
+    }
+
+    fun addEndpointListener(listener: PNEndpointListener): PNSocket {
+        endpointListeners.add(listener)
+        return this
+    }
+
+    fun removeEndpointListener(listener: PNEndpointListener): PNSocket {
+        endpointListeners.remove(listener)
+        return this
+    }
+
+    /** Endpoint of the current connection, or null when not connected. */
+    fun connectedEndpoint(): PNEndpoint? = connectedEndpoint
 
     /**
      * Stream messages from a channel (MQTT: subscribe)
@@ -144,6 +264,7 @@ class PNSocket(
 
         if (!activeChannels.contains(channel)) {
             try {
+                Log.d(TAG, "Subscribing to channel: $channel (QoS=${mode.qos})")
                 mqttClient?.subscribe(channel, mode.qos, null, object : IMqttActionListener {
                     override fun onSuccess(token: IMqttToken?) {
                         Log.d(TAG, "Streaming from channel: $channel")
@@ -151,6 +272,10 @@ class PNSocket(
                     }
 
                     override fun onFailure(token: IMqttToken?, exception: Throwable?) {
+                        Log.e(TAG, "Failed to stream from channel: $channel - ${exception?.message}")
+                        exception?.cause?.let {
+                            Log.e(TAG, "Stream failure cause: ${it::class.java.name}: ${it.message}")
+                        }
                         val error = PNError(
                             PNError.Code.STREAM_FAILED,
                             "Failed to stream from $channel: ${exception?.message}",
@@ -160,9 +285,12 @@ class PNSocket(
                     }
                 })
             } catch (e: Exception) {
+                Log.e(TAG, "Stream exception for channel: $channel - ${e.message}")
                 val error = PNError.fromException(e, "Stream failed")
                 notifyError(error)
             }
+        } else {
+            Log.d(TAG, "Already streaming from channel: $channel")
         }
 
         return this
@@ -314,37 +442,49 @@ class PNSocket(
     // Internal MQTT Implementation
     // ========================================================================
 
+    private fun defaultEndpoint() = PNEndpoint(config.gateway, config.port, config.secure)
+
+    private fun resolveEndpoints(): List<PNEndpoint> {
+        val provided = try {
+            endpointProvider?.endpoints().orEmpty()
+        } catch (e: Exception) {
+            Log.w(TAG, "Endpoint provider failed: ${e.message}")
+            emptyList()
+        }
+        return provided.ifEmpty { listOf(defaultEndpoint()) }
+    }
+
     private fun connectInternal() {
         // Prevent concurrent connection attempts that cause EMQX session takeover
-        if (!isConnecting.compareAndSet(false, true)) {
+        val gen = connectGuard.tryBegin()
+        if (gen == null) {
             Log.d(TAG, "Connection already in progress - skipping")
             return
         }
 
+        var client: MqttAsyncClient? = null
         try {
             // Clean up existing client
-            mqttClient?.let { client ->
-                try {
-                    if (client.isConnected) client.disconnect()
-                    client.close()
-                } catch (e: Exception) {
-                    Log.w(TAG, "Error cleaning up old client: ${e.message}")
-                }
-            }
+            mqttClient?.let { shutdownQuietly(it) }
             mqttClient = null
+
+            if (!rotation.inRound()) {
+                rotation.startRound(resolveEndpoints())
+            }
+            val endpoint = rotation.current() ?: defaultEndpoint()
 
             state = PNState.CONNECTING
             notifyStateChange(PNState.CONNECTING)
 
             // Build MQTT server URI
-            val protocol = if (config.secure) "ssl" else "tcp"
-            val serverUri = "$protocol://${config.gateway}:${config.port}"
+            val serverUri = endpoint.uri
 
-            Log.d(TAG, "Connecting to gateway: $serverUri (clientId: ${config.clientId})")
+            Log.d(TAG, "Connecting to gateway: $serverUri (clientId: ${config.clientId}, endpoint ${rotation.position() + 1}/${rotation.size()})")
 
             // Create MQTT client
-            mqttClient = MqttAsyncClient(serverUri, config.clientId, MemoryPersistence())
-            mqttClient?.setCallback(createMqttCallback())
+            client = MqttAsyncClient(serverUri, config.clientId, MemoryPersistence())
+            mqttClient = client
+            client.setCallback(createMqttCallback(client, gen, endpoint))
 
             // Build connection options
             val options = MqttConnectOptions().apply {
@@ -374,7 +514,8 @@ class PNSocket(
             }
 
             // Connect
-            mqttClient?.connect(options, null, object : IMqttActionListener {
+            val connectingClient = client
+            client.connect(options, null, object : IMqttActionListener {
                 override fun onSuccess(token: IMqttToken?) {
                     Log.d(TAG, "Connection initiated successfully")
                 }
@@ -387,18 +528,11 @@ class PNSocket(
                             Log.e(TAG, "Connection failed root cause: ${root::class.java.name}: ${root.message}")
                         }
                     }
-                    isConnecting.set(false)
-                    state = PNState.DISCONNECTED
-
                     val error = PNError.connectionFailed(
                         exception?.message ?: "Connection failed",
                         exception
                     )
-                    notifyError(error)
-
-                    if (!manualDisconnect.get()) {
-                        scheduleRetry()
-                    }
+                    handleConnectFailure(connectingClient, gen, exception, error)
                 }
             })
 
@@ -407,37 +541,101 @@ class PNSocket(
             e.cause?.let { cause ->
                 Log.e(TAG, "Connection error cause: ${cause::class.java.name}: ${cause.message}")
             }
-            isConnecting.set(false)
-            state = PNState.DISCONNECTED
+            handleConnectFailure(client, gen, e, PNError.fromException(e, "Connection failed"))
+        }
+    }
 
-            val error = PNError.fromException(e, "Connection failed")
-            notifyError(error)
+    private fun handleConnectFailure(
+        client: MqttAsyncClient?,
+        gen: Int,
+        exception: Throwable?,
+        error: PNError
+    ) {
+        if (!connectGuard.finish(gen)) {
+            // A newer attempt (or close()) replaced this one
+            Log.d(TAG, "Ignoring failure of an abandoned connection attempt")
+            if (client != null && client !== mqttClient) shutdownQuietly(client)
+            return
+        }
 
-            if (!manualDisconnect.get()) {
-                scheduleRetry()
+        state = PNState.DISCONNECTED
+        notifyError(error)
+
+        if (manualDisconnect.get()) return
+
+        val rejected = PNFailures.isRejectedByBroker(exception)
+        if (rotation.onConnectFailure(rejected)) {
+            Log.w(TAG, "Endpoint unreachable - trying next endpoint ${rotation.current()}")
+            scheduleFailover()
+        } else {
+            scheduleRetry()
+        }
+    }
+
+    private fun scheduleFailover() {
+        cancelRetry()
+        val runnable = Runnable {
+            retryRunnable = null
+            if (!manualDisconnect.get()) connectInternal()
+        }
+        retryRunnable = runnable
+        mainHandler.postDelayed(runnable, FAILOVER_DELAY_MS)
+    }
+
+    /** Disconnect and close [client] without blocking the caller. Never throws. */
+    private fun shutdownQuietly(client: MqttAsyncClient) {
+        try {
+            client.setCallback(null)
+        } catch (_: Exception) {
+        }
+        cleanupExecutor.execute {
+            try {
+                client.disconnectForcibly(0, 1000, false)
+            } catch (_: Exception) {
+            }
+            try {
+                client.close(true)
+            } catch (_: Exception) {
             }
         }
     }
 
-    private fun createMqttCallback() = object : MqttCallbackExtended {
+    private fun createMqttCallback(
+        client: MqttAsyncClient,
+        gen: Int,
+        endpoint: PNEndpoint
+    ) = object : MqttCallbackExtended {
         override fun connectComplete(reconnect: Boolean, serverURI: String?) {
+            if (!connectGuard.finish(gen)) {
+                Log.d(TAG, "Abandoned client connected to $serverURI - closing it")
+                shutdownQuietly(client)
+                return
+            }
+
             Log.d(TAG, "Connected to $serverURI (reconnect: $reconnect)")
 
-            isConnecting.set(false)
             state = PNState.CONNECTED
             resetRetryState()
+            rotation.onConnected()
+            connectedEndpoint = endpoint
             notifyStateChange(PNState.CONNECTED)
             notifyConnected()
+            notifyEndpointConnected(endpoint)
 
             // Resubscribe to active channels (needed because cleanSession=true)
             resubscribeChannels()
         }
 
         override fun connectionLost(cause: Throwable?) {
+            if (!connectGuard.isCurrent(gen)) {
+                Log.d(TAG, "Ignoring connection loss of an abandoned client")
+                return
+            }
             Log.e(TAG, "Connection lost: ${cause?.message}")
 
-            isConnecting.set(false)
             state = PNState.DISCONNECTED
+            connectedEndpoint = null
+            rotation.reset()
             // NOTE: activeChannels is intentionally NOT cleared here
             // so resubscribeChannels() can restore them after reconnect
 
@@ -454,6 +652,7 @@ class PNSocket(
         }
 
         override fun messageArrived(topic: String?, message: MqttMessage?) {
+            Log.d(TAG, "messageArrived() called: topic=$topic, payloadSize=${message?.payload?.size}")
             if (topic == null || message == null) return
 
             val pnMessage = PNMessage.fromMqtt(
@@ -493,19 +692,27 @@ class PNSocket(
     }
 
     private fun resubscribeChannels() {
-        if (activeChannels.isEmpty()) return
+        if (activeChannels.isEmpty()) {
+            Log.d(TAG, "resubscribeChannels() - no active channels to resubscribe")
+            return
+        }
 
         val channels = activeChannels.toTypedArray()
         val qos = IntArray(channels.size) { PNDeliveryMode.RELIABLE.qos }
 
+        Log.d(TAG, "Resubscribing to ${channels.size} channels: ${channels.toList()}")
+
         try {
             mqttClient?.subscribe(channels, qos, null, object : IMqttActionListener {
                 override fun onSuccess(token: IMqttToken?) {
-                    Log.d(TAG, "Resubscribed to ${channels.size} channels")
+                    Log.d(TAG, "Resubscribed to ${channels.size} channels successfully")
                 }
 
                 override fun onFailure(token: IMqttToken?, exception: Throwable?) {
                     Log.e(TAG, "Resubscribe failed: ${exception?.message}")
+                    exception?.cause?.let {
+                        Log.e(TAG, "Resubscribe failure cause: ${it::class.java.name}: ${it.message}")
+                    }
                 }
             })
         } catch (e: Exception) {
@@ -539,12 +746,8 @@ class PNSocket(
     // Reconnection with Exponential Backoff
     // ========================================================================
 
-    private fun calculateRetryDelay(attempt: Int): Long {
-        val exponentialDelay = config.reconnectDelay * BACKOFF_MULTIPLIER.pow(attempt.toDouble())
-        val cappedDelay = min(exponentialDelay.toLong(), config.maxReconnectDelay)
-        val jitter = (cappedDelay * JITTER_FACTOR * (Math.random() * 2 - 1)).toLong()
-        return cappedDelay + jitter
-    }
+    private fun calculateRetryDelay(attempt: Int): Long =
+        PNBackoff.delay(attempt, config.reconnectDelay, config.maxReconnectDelay, Math.random())
 
     private fun scheduleRetry() {
         if (manualDisconnect.get()) return
@@ -567,13 +770,17 @@ class PNSocket(
         notifyStateChange(PNState.RECONNECTING)
         notifyReconnecting(currentAttempt, delayMs)
 
+        cancelRetry()
         isRetrying.set(true)
-        retryRunnable = Runnable {
+        val runnable = Runnable {
+            retryRunnable = null
+            if (manualDisconnect.get()) return@Runnable
             val newAttempt = retryAttempt.incrementAndGet()
             Log.d(TAG, "Executing retry attempt $newAttempt")
             connectInternal()
         }
-        mainHandler.postDelayed(retryRunnable!!, delayMs)
+        retryRunnable = runnable
+        mainHandler.postDelayed(runnable, delayMs)
     }
 
     private fun cancelRetry() {
@@ -619,6 +826,12 @@ class PNSocket(
     private fun notifyReconnecting(attempt: Int, nextRetryMs: Long) {
         mainHandler.post {
             connectionListeners.forEach { it.onReconnecting(attempt, nextRetryMs) }
+        }
+    }
+
+    private fun notifyEndpointConnected(endpoint: PNEndpoint) {
+        mainHandler.post {
+            endpointListeners.forEach { it.onEndpointConnected(endpoint) }
         }
     }
 
