@@ -12,7 +12,7 @@ Lightweight messaging protocol layer by Rivium Push with offline-first sync.
 
 ```kotlin
 dependencies {
-    implementation("co.rivium:pn-protocol:0.2.1")
+    implementation("co.rivium:pn-protocol:0.2.2")
 }
 ```
 
@@ -20,7 +20,7 @@ dependencies {
 
 ```groovy
 dependencies {
-    implementation 'co.rivium:pn-protocol:0.2.1'
+    implementation 'co.rivium:pn-protocol:0.2.2'
 }
 ```
 

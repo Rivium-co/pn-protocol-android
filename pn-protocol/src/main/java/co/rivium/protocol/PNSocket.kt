@@ -114,16 +114,22 @@ class PNSocket(
 
         Log.d(TAG, "Closing connection")
 
+        // A goodbye only makes sense on an established connection. A client
+        // that is still connecting is dropped instead (see PNClientTeardown).
+        val wasConnected = state == PNState.CONNECTED
         state = PNState.DISCONNECTING
         notifyStateChange(PNState.DISCONNECTING)
 
         val client = mqttClient
         try {
-            client?.disconnect()?.waitForCompletion(5000)
-            client?.close()
-        } catch (e: Exception) {
-            Log.w(TAG, "Error during close: ${e.message}")
-            client?.let { shutdownQuietly(it) }
+            if (client != null) {
+                if (!wasConnected) {
+                    shutdownQuietly(client)
+                } else if (!PNClientTeardown.graceful(client)) {
+                    Log.w(TAG, "Graceful close did not complete; dropping the connection")
+                    shutdownQuietly(client, PNClientTeardown.SETTLE_AFTER_GRACEFUL_MS)
+                }
+            }
         } finally {
             mqttClient = null
             connectedEndpoint = null
@@ -583,21 +589,12 @@ class PNSocket(
     }
 
     /** Disconnect and close [client] without blocking the caller. Never throws. */
-    private fun shutdownQuietly(client: MqttAsyncClient) {
+    private fun shutdownQuietly(client: MqttAsyncClient, settleMs: Long = 0) {
         try {
             client.setCallback(null)
         } catch (_: Exception) {
         }
-        cleanupExecutor.execute {
-            try {
-                client.disconnectForcibly(0, 1000, false)
-            } catch (_: Exception) {
-            }
-            try {
-                client.close(true)
-            } catch (_: Exception) {
-            }
-        }
+        cleanupExecutor.execute { PNClientTeardown.force(client, settleMs) }
     }
 
     private fun createMqttCallback(
