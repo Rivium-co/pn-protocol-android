@@ -53,7 +53,7 @@ mavenPublishing {
 
     pom {
         name.set("PN Protocol")
-        description.set("Lightweight MQTT-based messaging protocol by Rivium (rivium.co)")
+        description.set("Lightweight realtime messaging protocol by Rivium (rivium.co)")
         inceptionYear.set("2024")
         url.set("https://rivium.co")
 
